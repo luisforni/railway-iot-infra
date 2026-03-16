@@ -1,0 +1,133 @@
+services:
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: railway_db
+      POSTGRES_USER: railway
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ../railway-iot-timescale-db/migrations/:/docker-entrypoint-initdb.d/:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railway -d railway_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mqtt:
+    build: ../railway-iot-mqtt-broker
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - mqtt_data:/mosquitto/data
+      - mqtt_logs:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -i healthcheck -W 3"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  api:
+    build: ../railway-iot-django-api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    ports:
+      - "8003:8000"
+
+  worker:
+    build: ../railway-iot-django-api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A core worker -l info -c 4
+
+  beat:
+    build: ../railway-iot-django-api
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A core beat -l info
+
+  ml:
+    build: ../railway-iot-ml-engine
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8004:8001"
+    volumes:
+      - ml_models:/app/models
+
+  simulator:
+    build: ../railway-iot-sensor-simulator
+    restart: unless-stopped
+    depends_on:
+      mqtt:
+        condition: service_started
+    command: >
+      python src/simulator.py --host mqtt --devices 5 --interval 2000
+      --zone zona-norte --zone zona-centro --zone zona-sur
+      --zone zona-este  --zone zona-oeste --anomaly
+    profiles:
+      - simulator
+
+  dashboard:
+    build:
+      context: ../railway-iot-dashboard
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3100:3000"
+    depends_on: [api]
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api, dashboard]
+    profiles:
+      - production
+
+volumes:
+  db_data:
+  redis_data:
+  mqtt_data:
+  mqtt_logs:
+  ml_models:
